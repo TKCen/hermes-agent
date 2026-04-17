@@ -107,6 +107,8 @@ DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
+DEFAULT_KOKORO_VOICE = "af_nicole"
+DEFAULT_KOKORO_FASTAPI_BASE_URL = "http://localhost:8880/v1"
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -759,6 +761,127 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
 
 
 # ===========================================================================
+# Provider: Kokoro TTS (local, free, on-device)
+# ===========================================================================
+def _generate_kokoro(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech using Kokoro-82M on-device TTS.
+
+    Kokoro outputs 24kHz mono WAV natively. The caller handles conversion
+    to MP3/OGG for the desired output format.
+    """
+    from kokoro import KPipeline
+
+    kokoro_config = tts_config.get("kokoro", {})
+    voice = kokoro_config.get("voice", DEFAULT_KOKORO_VOICE)
+    # lang_code 'a' = American English; 'b' = British English
+    lang_code = kokoro_config.get("lang_code", "a")
+
+    # Kokoro outputs WAV; use a .wav path for generation,
+    # let the caller convert to the final format afterward.
+    wav_path = output_path
+    if not output_path.endswith(".wav"):
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+
+    pipeline = KPipeline(lang_code=lang_code)
+    generator = pipeline(text, voice=voice)
+
+    # KPipeline yields Result objects with an audio torch.Tensor attribute
+    audio_chunks = []
+    for result in generator:
+        audio_chunks.append(result.audio)
+
+    if not audio_chunks:
+        raise RuntimeError("Kokoro TTS produced no audio output")
+
+    # Concatenate all tensor chunks and convert to numpy
+    import numpy as np
+    audio = np.concatenate([c.cpu().numpy() for c in audio_chunks])
+
+    # Kokoro outputs float32 audio in range ~[-1, 1]; convert to int16 for WAV
+    audio_int16 = (audio * 32767).astype(np.int16)
+
+    # Write as 24kHz mono WAV
+    import wave
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(24000)
+        wf.writeframes(audio_int16.tobytes())
+
+    # If the caller wanted MP3 or OGG, convert from WAV
+    if wav_path != output_path:
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path:
+            conv_cmd = [ffmpeg_path, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            subprocess.run(conv_cmd, check=True, timeout=30)
+            os.remove(wav_path)
+        else:
+            # No ffmpeg — just rename the WAV to the expected path
+            os.rename(wav_path, output_path)
+
+    return output_path
+
+
+# ===========================================================================
+# Provider: Kokoro FastAPI (local Docker server)
+# ===========================================================================
+def _generate_kokoro_fastapi(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech using Kokoro-FastAPI Docker container.
+
+    Kokoro-FastAPI is an OpenAI-compatible API server running in a Docker container.
+    It supports voice blending, multiple output formats, and streaming.
+
+    Args:
+        text: Text to convert.
+        output_path: Where to save the audio file.
+        tts_config: TTS config dict.
+
+    Returns:
+        Path to the saved audio file.
+    """
+    import requests
+
+    kokoro_config = tts_config.get("kokoro_fastapi", {})
+    base_url = kokoro_config.get("base_url", DEFAULT_KOKORO_FASTAPI_BASE_URL).rstrip("/")
+    voice = kokoro_config.get("voice", DEFAULT_KOKORO_VOICE)
+    speed = float(kokoro_config.get("speed", tts_config.get("speed", 1.0)))
+
+    # Determine response format from extension
+    if output_path.endswith(".ogg"):
+        response_format = "opus"
+    elif output_path.endswith(".wav"):
+        response_format = "wav"
+    elif output_path.endswith(".flac"):
+        response_format = "flac"
+    elif output_path.endswith(".m4a"):
+        response_format = "m4a"
+    elif output_path.endswith(".pcm"):
+        response_format = "pcm"
+    else:
+        response_format = "mp3"
+
+    payload = {
+        "model": "tts-1",
+        "input": text,
+        "voice": voice,
+        "response_format": response_format,
+        "speed": speed,
+    }
+
+    response = requests.post(
+        f"{base_url}/audio/speech",
+        json=payload,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+
+    return output_path
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def text_to_speech_tool(
@@ -877,6 +1000,14 @@ def text_to_speech_tool(
             logger.info("Generating speech with NeuTTS (local)...")
             _generate_neutts(text, file_str, tts_config)
 
+        elif provider == "kokoro":
+            logger.info("Generating speech with Kokoro TTS (local)...")
+            _generate_kokoro(text, file_str, tts_config)
+
+        elif provider == "kokoro_fastapi":
+            logger.info("Generating speech with Kokoro-FastAPI (Docker)...")
+            _generate_kokoro_fastapi(text, file_str, tts_config)
+
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
             edge_available = True
@@ -916,7 +1047,7 @@ def text_to_speech_tool(
         # Try Opus conversion for Telegram compatibility
         # Edge TTS outputs MP3, NeuTTS outputs WAV — both need ffmpeg conversion
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai") and not file_str.endswith(".ogg"):
+        if provider in ("edge", "neutts", "minimax", "xai", "kokoro", "kokoro_fastapi") and not file_str.endswith(".ogg"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
@@ -1037,6 +1168,24 @@ def _has_openai_audio_backend() -> bool:
 # Sentence boundary pattern: punctuation followed by space or newline
 _SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?])(?:\s|\n)|(?:\n\n)')
 
+# Reasoning/thinking block patterns (matched before markdown stripping)
+_MD_REASONING_BLOCK = re.compile(
+    r'💭\s*\*\*Reasoning:\*\*\s*\n```[\s\S]*?```',
+    re.IGNORECASE
+)
+_MD_MINIMAX_REASONING = re.compile(
+    r'💭\s*Reasoning:\s*\n```[\s\S]*?```',
+    re.IGNORECASE
+)
+_MD_THINK_BLOCK = re.compile(
+    r'<think>[\s\S]*?</think>',
+    re.IGNORECASE
+)
+_MD_XTAG_REASONING = re.compile(
+    r'<reasoning>[\s\S]*?</reasoning>',
+    re.IGNORECASE
+)
+
 # Markdown stripping patterns (same as cli.py _voice_speak_response)
 _MD_CODE_BLOCK = re.compile(r'```[\s\S]*?```')
 _MD_LINK = re.compile(r'\[([^\]]+)\]\([^)]+\)')
@@ -1051,7 +1200,13 @@ _MD_EXCESS_NL = re.compile(r'\n{3,}')
 
 
 def _strip_markdown_for_tts(text: str) -> str:
-    """Remove markdown formatting that shouldn't be spoken aloud."""
+    """Remove markdown formatting and reasoning blocks that shouldn't be spoken aloud."""
+    # Strip reasoning blocks first (before markdown processing)
+    text = _MD_REASONING_BLOCK.sub('', text)
+    text = _MD_MINIMAX_REASONING.sub('', text)
+    text = _MD_THINK_BLOCK.sub('', text)
+    text = _MD_XTAG_REASONING.sub('', text)
+    # Then strip markdown formatting
     text = _MD_CODE_BLOCK.sub(' ', text)
     text = _MD_LINK.sub(r'\1', text)
     text = _MD_URL.sub('', text)

@@ -5483,6 +5483,20 @@ class GatewayRunner:
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         import uuid as _uuid
+        import re as _re
+
+        # Strip thinking/reasoning blocks before TTS — the reasoning was
+        # already shown to the user in the text message; we don't read it aloud.
+        _THINK_PATTERNS = [
+            _re.compile(r'<reasoning>[\s\S]*?</reasoning>', _re.IGNORECASE),
+            _re.compile(r'<think>[\s\S]*?</think>', _re.IGNORECASE),
+            _re.compile(r'<thinking>[\s\S]*?</thinking>', _re.IGNORECASE),
+            _re.compile(r'<thought>[\s\S]*?</thought>', _re.IGNORECASE),
+            _re.compile(r'💭 \*\*Reasoning:\*\*[\s\S]*?(?=\n\n|\Z)', _re.IGNORECASE),
+        ]
+        for pat in _THINK_PATTERNS:
+            text = pat.sub('', text)
+
         audio_path = None
         actual_path = None
         try:
