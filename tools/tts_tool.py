@@ -2,7 +2,7 @@
 """
 Text-to-Speech Tool Module
 
-Supports seven TTS providers:
+Supports eight TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
@@ -10,6 +10,7 @@ Supports seven TTS providers:
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
+- Kokoro-FastAPI (local Docker): OpenAI-compatible Kokoro via Docker container at localhost:8880
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
@@ -107,6 +108,17 @@ DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
+# Voice blending syntax: voice_a(w1)+voice_b(w2) where weights are 1-10 (default 5=50/50)
+# Examples:
+#   af_nicole(5)+af_bella(5)     — Nicole + Bella, 50/50 blend (Sera's voice)
+#   af_nicole(7)+af_bella(3)     — Nicole dominant, warm and intimate
+#   af_bella(8)+af_sarah(2)       — Bella dominant, bright
+#   am_adam(5)+am_michael(5)      — Male blend, American
+#   bf_emma(5)+bf_isabella(5)     — Female, British
+#   bm_george(5)+bm_lewis(5)      — Male, British
+DEFAULT_KOKORO_VOICE = "af_nicole(5)+af_bella(5)"
+DEFAULT_KOKORO_SPEED = 1.0
+DEFAULT_KOKORO_FASTAPI_BASE_URL = "http://localhost:8880/v1"
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -758,6 +770,65 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     return output_path
 
 
+# ============================================================================
+# Provider: Kokoro FastAPI (local Docker server)
+# ============================================================================
+def _generate_kokoro_fastapi(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech using Kokoro-FastAPI Docker container.
+
+    Kokoro-FastAPI is an OpenAI-compatible API server running in a Docker container.
+    It supports voice blending, multiple output formats, and streaming.
+
+    Args:
+        text: Text to convert.
+        output_path: Where to save the audio file.
+        tts_config: TTS config dict.
+
+    Returns:
+        Path to the saved audio file.
+    """
+    import requests
+
+    kokoro_config = tts_config.get("kokoro_fastapi", {})
+    base_url = kokoro_config.get("base_url", DEFAULT_KOKORO_FASTAPI_BASE_URL).rstrip("/")
+    voice = kokoro_config.get("voice", DEFAULT_KOKORO_VOICE)
+    speed = float(kokoro_config.get("speed", tts_config.get("speed", DEFAULT_KOKORO_SPEED)))
+
+    # Determine response format from extension
+    if output_path.endswith(".ogg"):
+        response_format = "opus"
+    elif output_path.endswith(".wav"):
+        response_format = "wav"
+    elif output_path.endswith(".flac"):
+        response_format = "flac"
+    elif output_path.endswith(".m4a"):
+        response_format = "m4a"
+    elif output_path.endswith(".pcm"):
+        response_format = "pcm"
+    else:
+        response_format = "mp3"
+
+    payload = {
+        "model": "tts-1",
+        "input": text,
+        "voice": voice,
+        "response_format": response_format,
+        "speed": speed,
+    }
+
+    response = requests.post(
+        f"{base_url}/audio/speech",
+        json=payload,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+
+    return output_path
+
+
 # ===========================================================================
 # Main tool function
 # ===========================================================================
@@ -877,6 +948,10 @@ def text_to_speech_tool(
             logger.info("Generating speech with NeuTTS (local)...")
             _generate_neutts(text, file_str, tts_config)
 
+        elif provider == "kokoro_fastapi":
+            logger.info("Generating speech with Kokoro-FastAPI (Docker)...")
+            _generate_kokoro_fastapi(text, file_str, tts_config)
+
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
             edge_available = True
@@ -921,7 +996,7 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in ("elevenlabs", "openai", "mistral", "gemini"):
+        elif provider in ("elevenlabs", "openai", "mistral", "gemini", "kokoro_fastapi"):
             voice_compatible = file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)
